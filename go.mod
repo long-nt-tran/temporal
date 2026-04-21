@@ -232,4 +232,4 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace go.temporal.io/api => github.com/long-nt-tran/api-go v0.0.0-20260429181202-ecfd1a36025b
+replace go.temporal.io/api => github.com/long-nt-tran/api-go v0.0.0-20260504145429-f98e2ca9aa37
