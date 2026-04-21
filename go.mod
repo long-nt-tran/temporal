@@ -83,6 +83,8 @@ require (
 	modernc.org/sqlite v1.44.3
 )
 
+require pgregory.net/rapid v1.2.0
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.121.6 // indirect; indirect e
