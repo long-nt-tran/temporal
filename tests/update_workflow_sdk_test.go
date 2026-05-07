@@ -3,10 +3,11 @@ package tests
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -17,9 +18,13 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+	"go.temporal.io/server/api/adminservice/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	"go.temporal.io/server/common/testing/testvars"
+	"go.temporal.io/server/components/callbacks"
 	"go.temporal.io/server/tests/testcore"
 )
 
@@ -419,8 +424,8 @@ func (s *UpdateWorkflowSdkSuite) TestUpdateSameRequestIDDeduplicatesCallbacks() 
 
 	taskQueue := testcore.RandomizeStr(s.T().Name())
 	updateID := "dedup-callbacks-test"
-	requestID1 := uuid.NewString()
-	requestID2 := uuid.NewString()
+	requestID1 := s.T().Name() + "-1"
+	requestID2 := s.T().Name() + "-2"
 
 	// Workflow where the update handler blocks until signaled.
 	wf := func(ctx workflow.Context, input string) (string, error) {
@@ -447,6 +452,12 @@ func (s *UpdateWorkflowSdkSuite) TestUpdateSameRequestIDDeduplicatesCallbacks() 
 	}, wf, "input")
 	s.NoError(err)
 
+	// Build a unique callback URL per requestID so we can assert that the two
+	// distinct requests produced two distinct callbacks (not just two callbacks
+	// of any kind).
+	urlFor := func(reqID string) string {
+		return "http://localhost:9999/callback/" + reqID
+	}
 	makeRequest := func(reqID string) *workflowservice.UpdateWorkflowExecutionRequest {
 		return &workflowservice.UpdateWorkflowExecutionRequest{
 			Namespace:         s.Namespace().String(),
@@ -457,7 +468,7 @@ func (s *UpdateWorkflowSdkSuite) TestUpdateSameRequestIDDeduplicatesCallbacks() 
 				Input:     &updatepb.Input{Name: "update", Args: &commonpb.Payloads{Payloads: []*commonpb.Payload{testcore.MustToPayload(s.T(), "test")}}},
 				RequestId: reqID,
 				CompletionCallbacks: []*commonpb.Callback{{
-					Variant: &commonpb.Callback_Nexus_{Nexus: &commonpb.Callback_Nexus{Url: "http://localhost:9999/callback"}},
+					Variant: &commonpb.Callback_Nexus_{Nexus: &commonpb.Callback_Nexus{Url: urlFor(reqID)}},
 				}},
 			},
 		}
@@ -475,22 +486,153 @@ func (s *UpdateWorkflowSdkSuite) TestUpdateSameRequestIDDeduplicatesCallbacks() 
 	_, err = s.FrontendClient().UpdateWorkflowExecution(ctx, makeRequest(requestID2))
 	s.NoError(err)
 
-	// Verify exactly 2 update callbacks: one from requestID1 (first request),
-	// one from requestID2 (third request). The second request was deduped.
+	// Verify exactly 2 update callbacks with the expected unique URLs: one from
+	// requestID1 (first request), one from requestID2 (third request). The
+	// second request was deduped.
 	descResp, err := s.FrontendClient().DescribeWorkflowExecution(ctx, &workflowservice.DescribeWorkflowExecutionRequest{
 		Namespace: s.Namespace().String(),
 		Execution: &commonpb.WorkflowExecution{WorkflowId: run.GetID()},
 	})
 	s.NoError(err)
-	updateCallbackCount := 0
+	updateCallbackURLs := make(map[string]struct{})
 	for _, cb := range descResp.GetCallbacks() {
-		if cb.GetTrigger().GetUpdateWorkflowExecutionCompleted() != nil {
-			updateCallbackCount++
+		if cb.GetTrigger().GetUpdateWorkflowExecutionCompleted() == nil {
+			continue
 		}
+		updateCallbackURLs[cb.GetCallback().GetNexus().GetUrl()] = struct{}{}
 	}
-	s.Equal(2, updateCallbackCount, "expected 2 callbacks: requestID1 (original) + requestID2 (new), with duplicate requestID1 deduped")
+	s.Equal(
+		map[string]struct{}{urlFor(requestID1): {}, urlFor(requestID2): {}},
+		updateCallbackURLs,
+		"expected one callback per unique requestID, with duplicate requestID1 deduped",
+	)
 
 	// Clean up.
 	s.NoError(s.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "complete-update", nil))
+	s.NoError(s.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "stop", nil))
+}
+
+// TestUpdateCallbackCleanupAfterFiring verifies that an update-level callback
+// removes itself from the CHASM tree after it transitions to a terminal
+// state.
+func (s *UpdateWorkflowSdkSuite) TestUpdateCallbackCleanupAfterFiring() {
+	s.OverrideDynamicConfig(dynamicconfig.EnableChasm, true)
+	s.OverrideDynamicConfig(dynamicconfig.EnableCHASMCallbacks, true)
+	s.OverrideDynamicConfig(dynamicconfig.EnableWorkflowUpdateCallbacks, true)
+	// Allow the httptest server's localhost URL as a callback target.
+	s.OverrideDynamicConfig(
+		callbacks.AllowedAddresses,
+		[]any{map[string]any{"Pattern": "*", "AllowInsecure": true}},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	// Make a HTTP server with a completionHandler that waits for an ack (from this test) via the
+	// requestCompleteCh before completing the operation, allowing us to be able to deterministically
+	// wait until the completion callback gets fired.
+	cbHandler := &completionHandler{
+		requestCh:         make(chan *nexusrpc.CompletionRequest, 1),
+		requestCompleteCh: make(chan error, 1),
+	}
+	httpHandler := nexusrpc.NewCompletionHTTPHandler(nexusrpc.CompletionHandlerOptions{Handler: cbHandler})
+	srv := httptest.NewServer(httpHandler)
+	s.T().Cleanup(srv.Close)
+
+	taskQueue := testcore.RandomizeStr(s.T().Name())
+	updateID := "cleanup-test"
+	requestID := s.T().Name() + "-1"
+
+	// Workflow whose update handler blocks until signaled.
+	wf := func(ctx workflow.Context, input string) (string, error) {
+		if err := workflow.SetUpdateHandler(ctx, "update", func(ctx workflow.Context, input string) (string, error) {
+			signalCh := workflow.GetSignalChannel(ctx, "complete-update")
+			signalCh.Receive(ctx, nil)
+			return "updated: " + input, nil
+		}); err != nil {
+			return "", err
+		}
+		signalCh := workflow.GetSignalChannel(ctx, "stop")
+		signalCh.Receive(ctx, nil)
+		return "done: " + input, nil
+	}
+
+	w := worker.New(s.SdkClient(), taskQueue, worker.Options{})
+	w.RegisterWorkflow(wf)
+	s.NoError(w.Start())
+	s.T().Cleanup(w.Stop)
+
+	run, err := s.SdkClient().ExecuteWorkflow(ctx, sdkclient.StartWorkflowOptions{
+		ID:        testcore.RandomizeStr("wf"),
+		TaskQueue: taskQueue,
+	}, wf, "input")
+	s.NoError(err)
+
+	// Send the update with a completion callback. WaitPolicy=ACCEPTED returns
+	// once the update is in stateAccepted (callback now persisted in CHASM)
+	_, err = s.FrontendClient().UpdateWorkflowExecution(ctx, &workflowservice.UpdateWorkflowExecutionRequest{
+		Namespace:         s.Namespace().String(),
+		WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: run.GetID()},
+		WaitPolicy:        &updatepb.WaitPolicy{LifecycleStage: enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED},
+		Request: &updatepb.Request{
+			// use the hardcoded updateID so we can look up this node in the CHASM tree in assertions
+			Meta:      &updatepb.Meta{UpdateId: updateID},
+			Input:     &updatepb.Input{Name: "update", Args: &commonpb.Payloads{Payloads: []*commonpb.Payload{testcore.MustToPayload(s.T(), "test")}}},
+			RequestId: requestID,
+			CompletionCallbacks: []*commonpb.Callback{{
+				Variant: &commonpb.Callback_Nexus_{Nexus: &commonpb.Callback_Nexus{Url: srv.URL + "/callback"}},
+			}},
+		},
+	})
+	s.NoError(err)
+
+	// hasUpdateChasmNode reports whether any CHASM node path references the given update ID.
+	hasUpdateChasmNode := func(desc *adminservice.DescribeMutableStateResponse) bool {
+		for path := range desc.GetDatabaseMutableState().GetChasmNodes() {
+			if strings.Contains(path, updateID) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Sanity check that the callback is in the CHASM tree at this point since we sent the update request.
+	preDesc, err := s.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+		Namespace: s.Namespace().String(),
+		Execution: &commonpb.WorkflowExecution{WorkflowId: run.GetID()},
+		Archetype: chasm.WorkflowArchetype,
+	})
+	s.NoError(err)
+	s.True(hasUpdateChasmNode(preDesc), "expected at least one CHASM node referencing the update before the callback fires")
+
+	// Drive the update to completion so the standby callback gets scheduled.
+	s.NoError(s.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "complete-update", nil))
+
+	// Receive the inbound HTTP callback and ack it with success (nil error). This allows the Callback to
+	// be fired. This will allow us to verify (once the callback is fired) that the callback CHASM node
+	// is cleaned up.
+	select {
+	case <-cbHandler.requestCh:
+	case <-time.After(30 * time.Second):
+		s.FailNow("timed out waiting for the callback dispatch to reach the test HTTP server")
+	}
+	cbHandler.requestCompleteCh <- nil
+
+	// Using DescribeMutableState(...), we can verify that the CHASM callback node and the updateID -> callback
+	// entry has been cleaned up from the CHASM POV.
+	s.Eventually(func() bool {
+		desc, err := s.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+			Namespace: s.Namespace().String(),
+			Execution: &commonpb.WorkflowExecution{WorkflowId: run.GetID()},
+			Archetype: chasm.WorkflowArchetype,
+		})
+		if err != nil {
+			return false
+		}
+		return !hasUpdateChasmNode(desc)
+	}, 30*time.Second, 200*time.Millisecond,
+		"after the callback fires, the update entry and its callback should be gone from the CHASM tree")
+
+	// Clean up.
 	s.NoError(s.SdkClient().SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "stop", nil))
 }

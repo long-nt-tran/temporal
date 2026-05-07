@@ -165,11 +165,13 @@ func (u *Updater) ApplyRequest(
 		return nil, err
 	}
 
-	callbacksAttached, err := u.upd.AttachCallbacks(updateRequest, workflow.WithEffects(effect.Immediate(ctx), ms))
+	wroteEvent, err := u.upd.AttachCallbacks(updateRequest, workflow.WithEffects(effect.Immediate(ctx), ms))
 	if err != nil {
 		return nil, err
 	}
-	if callbacksAttached {
+	if wroteEvent {
+		// AttachCallbacks wrote a WorkflowExecutionOptionsUpdatedEvent; commit
+		// it without scheduling a new workflow task.
 		return &api.UpdateWorkflowAction{
 			Noop:               false,
 			CreateWorkflowTask: false,
@@ -275,15 +277,10 @@ func (u *Updater) OnSuccess(
 	}
 	resp := u.CreateResponse(u.wfKey, status.Outcome, status.Stage)
 	// Attach a link to the response. For accepted/completed updates, use a WorkflowEvent link
-	// with a RequestIdReference pointing to the accepted event. For rejected updates (stage
-	// COMPLETED with a failure outcome and no acceptance), use a Workflow link since rejected
-	// updates don't write any event to history.
-	requestID := u.req.GetRequest().GetRequest().GetRequestId()
-	isRejection := status.Outcome.GetFailure() != nil &&
-		status.Stage == enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED &&
-		u.upd.AcceptedEventID() == common.EmptyEventID
-	if isRejection {
-		// Rejected update: never accepted, so no event in history — link to the workflow itself.
+	// with a RequestIdReference pointing to the accepted event. For rejected updates, use a
+	// Workflow link since rejected updates don't write any event to history.
+	if status.Rejected {
+		// Rejected update: never accepted, so no event in history - link to the workflow itself.
 		resp.Response.Link = &commonpb.Link{
 			Variant: &commonpb.Link_Workflow_{
 				Workflow: &commonpb.Link_Workflow{
@@ -296,6 +293,7 @@ func (u *Updater) OnSuccess(
 		}
 	} else if status.Stage == enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED || status.Stage == enumspb.UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED {
 		// Accepted or completed update: link to the accepted event.
+		requestID := u.req.GetRequest().GetRequest().GetRequestId()
 		resp.Response.Link = &commonpb.Link{
 			Variant: &commonpb.Link_WorkflowEvent_{
 				WorkflowEvent: &commonpb.Link_WorkflowEvent{

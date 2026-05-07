@@ -13,6 +13,10 @@ type (
 		Stage enumspb.UpdateWorkflowExecutionLifecycleStage
 		// Outcome of Update if it is completed or rejected.
 		Outcome *updatepb.Outcome
+		// Rejected is true iff the update was rejected by the worker's
+		// validator (i.e., never accepted). Distinguishes a rejection from a
+		// regular completion that produced a failure outcome.
+		Rejected bool
 	}
 )
 
@@ -34,6 +38,7 @@ func statusRejected(rejection *failurepb.Failure) *Status {
 		Outcome: &updatepb.Outcome{
 			Value: &updatepb.Outcome_Failure{Failure: rejection},
 		},
+		Rejected: true,
 	}
 }
 

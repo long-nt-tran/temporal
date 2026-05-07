@@ -47,6 +47,21 @@ Note that Failure in an Update outcome is different from Update rejection.
 5. The Workflow Task to ship the Update request form the server to the worker must not be
 persisted in mutable state.
 
+### Completion callbacks and rejection
+
+`completion_callbacks` attached to an Update via `UpdateWorkflowExecution`
+are buffered in memory on the `Update` struct (`pendingCallbacks`) while
+the Update is in `Admitted` or `Sent` state. They become durable only on
+acceptance:
+
+- **Accepted**: `pendingCallbacks` get registered in the CHASM tree, persisting
+  them, where they will eventually fire (success or failure)
+  according to the Update's outcome.
+- **Rejected**: buffered callbacks in `pendingCallbacks` are dropped without writing any events.
+- **Aborted** (registry clear, workflow close, etc.): buffered callbacks
+  are dropped. The outcome future is set with the abort failure so the
+  long-poll returns and retries can recreate the Update.
+
 ## Update Registry
 Updates are managed through the `update.Registy` interface. A workflow's Update Registry is stored in
 its `workflow.ContextImpl` struct. Each Registry has an internal map which stores *admitted and

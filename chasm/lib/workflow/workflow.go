@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -67,30 +68,58 @@ func (w *Workflow) Terminate(
 	return chasm.TerminateComponentResponse{}, serviceerror.NewInternal("workflow root Terminate should not be called")
 }
 
-// ProcessCloseCallbacks triggers "WorkflowClosed" callbacks using the CHASM implementation.
-// It schedules all workflow-level and update-level callbacks that are in STANDBY state.
-func (w *Workflow) ProcessCloseCallbacks(ctx chasm.MutableContext) error {
-	if err := callback.ScheduleStandbyCallbacks(ctx, w.Callbacks); err != nil {
-		return err
-	}
-	return w.ProcessAllUpdateCloseCallbacks(ctx)
+// HasPendingCloseCallbacks returns true if there is any workflow-level
+// callback or update entry that may need to fire on workflow close. Used as a
+// fast-path check to avoid the writable-component allocation when there is
+// nothing to schedule.
+func (w *Workflow) HasPendingCloseCallbacks() bool {
+	return len(w.Callbacks) > 0 || w.HasPendingUpdateCallbacks()
 }
 
-// ProcessAllUpdateCloseCallbacks triggers callbacks for all updates without touching
-// workflow-level callbacks. This is used when the workflow is continuing to a new run
-// (ContinueAsNew, retry, cron): workflow-level callbacks are inherited by the new run,
-// but update callbacks must fire now because the update was aborted on the old run.
-func (w *Workflow) ProcessAllUpdateCloseCallbacks(ctx chasm.MutableContext) error {
+// HasPendingUpdateCallbacksFor returns true iff the given update has callbacks
+// registered.
+func (w *Workflow) HasPendingUpdateCallbacksFor(updateID string) bool {
+	_, ok := w.Updates[updateID]
+	return ok
+}
+
+// HasPendingUpdateCallbacks returns true if any update has callbacks registered.
+// Used when callers want to schedule update callbacks but not workflow-level
+// callbacks (e.g., on continue-as-new).
+func (w *Workflow) HasPendingUpdateCallbacks() bool {
+	return len(w.Updates) > 0
+}
+
+// ScheduleCloseCallbacks transitions all workflow-level and update-level
+// "WorkflowClosed" callbacks from STANDBY to SCHEDULED. Workflow-level and
+// update-level scheduling are independent: failure of one does not stop the
+// other; the errors are joined.
+func (w *Workflow) ScheduleCloseCallbacks(ctx chasm.MutableContext) error {
+	wfErr := callback.ScheduleStandbyCallbacks(ctx, w.Callbacks)
+	updErr := w.ScheduleAllUpdateCloseCallbacks(ctx)
+	return errors.Join(wfErr, updErr)
+}
+
+// ScheduleAllUpdateCloseCallbacks schedules callbacks for every update without
+// touching workflow-level callbacks. This is used when the workflow continues
+// to a new run (ContinueAsNew, retry, cron): workflow-level callbacks are
+// inherited by the new run, but update callbacks must fire now because the
+// update was aborted on the old run. Errors from individual updates are
+// joined so a single failing update does not prevent others from being
+// scheduled.
+func (w *Workflow) ScheduleAllUpdateCloseCallbacks(ctx chasm.MutableContext) error {
+	var errs []error
 	for _, updateField := range w.Updates {
 		if err := callback.ScheduleStandbyCallbacks(ctx, updateField.Get(ctx).Callbacks); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// ProcessUpdateCallbacks triggers callbacks for a single updateID if exists.
-func (w *Workflow) ProcessUpdateCallbacks(ctx chasm.MutableContext, updateID string) error {
+// ScheduleUpdateCallbacks schedules callbacks for a single updateID if it
+// exists. Returns NotFound if the update has no callbacks registered.
+func (w *Workflow) ScheduleUpdateCallbacks(ctx chasm.MutableContext, updateID string) error {
 	update, exists := w.Updates[updateID]
 	if !exists {
 		return serviceerror.NewNotFoundf("update with ID %s not found", updateID)
@@ -98,10 +127,10 @@ func (w *Workflow) ProcessUpdateCallbacks(ctx chasm.MutableContext, updateID str
 	return callback.ScheduleStandbyCallbacks(ctx, update.Get(ctx).Callbacks)
 }
 
-// RejectUpdate stores the rejection failure on the WorkflowUpdate component and
-// fires any pending callbacks. This is used when a reapplied update (after reset)
-// is rejected by the worker's validator - the callbacks need to deliver the
-// rejection failure to the caller.
+// RejectUpdate stores the rejection failure on the WorkflowUpdate component
+// and schedules any registered callbacks. Used when a reapplied update
+// (after reset) is rejected by the worker's validator: the callbacks need to
+// deliver the rejection failure to the caller.
 func (w *Workflow) RejectUpdate(ctx chasm.MutableContext, updateID string, rejectionFailure *failurepb.Failure) error {
 	updateField, exists := w.Updates[updateID]
 	if !exists {
@@ -139,18 +168,21 @@ func (w *Workflow) checkWorkflowCallbackLimit(ctx chasm.Context, newCount, maxCa
 }
 
 // addCallbacksToMap converts common callbacks to CHASM callback components and
-// inserts them into the target map, keyed by "<requestID>-<index>".
+// inserts them into target, keyed by "<requestID>-<index>". target must be
+// non-nil.
+//
+// All callbacks are validated up front, so target is not mutated unless every
+// callback can be converted successfully (atomic from the caller's POV).
 func addCallbacksToMap(
 	ctx chasm.MutableContext,
 	target chasm.Map[string, *callback.Callback],
 	requestID string,
 	eventTime *timestamppb.Timestamp,
 	completionCallbacks []*commonpb.Callback,
-) (chasm.Map[string, *callback.Callback], error) {
-	for idx, cb := range completionCallbacks {
-		chasmCB := &callbackspb.Callback{
-			Links: cb.GetLinks(),
-		}
+) error {
+	chasmCBs := make([]*callbackspb.Callback, len(completionCallbacks))
+	for i, cb := range completionCallbacks {
+		chasmCB := &callbackspb.Callback{Links: cb.GetLinks()}
 		switch variant := cb.Variant.(type) {
 		case *commonpb.Callback_Nexus_:
 			chasmCB.Variant = &callbackspb.Callback_Nexus_{
@@ -160,9 +192,12 @@ func addCallbacksToMap(
 				},
 			}
 		default:
-			return target, serviceerror.NewInvalidArgumentf("unsupported callback variant: %T", variant)
+			return serviceerror.NewInvalidArgumentf("unsupported callback variant: %T", variant)
 		}
+		chasmCBs[i] = chasmCB
+	}
 
+	for idx, chasmCB := range chasmCBs {
 		// requestID (unique per API call) + idx (position within the request) ensures unique, idempotent callback IDs.
 		// Unlike HSM callbacks, CHASM replicates entire trees rather than replaying events, so deterministic
 		// cross-cluster IDs based on event version are not needed.
@@ -174,7 +209,7 @@ func addCallbacksToMap(
 		callbackObj := callback.NewCallback(requestID, eventTime, &callbackspb.CallbackState{}, chasmCB)
 		target[id] = chasm.NewComponentField(ctx, callbackObj)
 	}
-	return target, nil
+	return nil
 }
 
 // AddCompletionCallbacks creates completion callbacks using the CHASM implementation.
@@ -193,10 +228,7 @@ func (w *Workflow) AddCompletionCallbacks(
 	if w.Callbacks == nil {
 		w.Callbacks = make(chasm.Map[string, *callback.Callback], len(completionCallbacks))
 	}
-
-	var err error
-	w.Callbacks, err = addCallbacksToMap(ctx, w.Callbacks, requestID, eventTime, completionCallbacks)
-	return err
+	return addCallbacksToMap(ctx, w.Callbacks, requestID, eventTime, completionCallbacks)
 }
 
 // AddUpdateCompletionCallbacks creates completion callbacks using the CHASM implementation.
@@ -239,10 +271,9 @@ func (w *Workflow) AddUpdateCompletionCallbacks(
 		)
 	}
 
-	var err error
-	update.Callbacks, err = addCallbacksToMap(ctx, update.Callbacks, requestID, eventTime, completionCallbacks)
-	return err
+	return addCallbacksToMap(ctx, update.Callbacks, requestID, eventTime, completionCallbacks)
 }
+
 
 // addAndApplyHistoryEvent adds a history event to the workflow and applies the corresponding event definition,
 // looked up by Go type. This is the preferred way to add and apply events as it provides go-to-definition navigation.

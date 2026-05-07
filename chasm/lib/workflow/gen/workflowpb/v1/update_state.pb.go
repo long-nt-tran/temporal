@@ -26,7 +26,7 @@ const (
 type UpdateState struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	UpdateId string                 `protobuf:"bytes,1,opt,name=update_id,json=updateId,proto3" json:"update_id,omitempty"`
-	// Populated when the update was rejected by a validator.
+	// Populated when the update was rejected by a validator in the workflow handler.
 	// Used to resolve the update outcome for callbacks on rejected updates.
 	RejectionFailure *v1.Failure `protobuf:"bytes,2,opt,name=rejection_failure,json=rejectionFailure,proto3" json:"rejection_failure,omitempty"`
 	unknownFields    protoimpl.UnknownFields

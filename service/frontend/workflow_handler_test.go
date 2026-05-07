@@ -4655,6 +4655,28 @@ func (s *WorkflowHandlerSuite) TestUpdateTaskQueueConfig_Validation() {
 	})
 }
 
+func (s *WorkflowHandlerSuite) TestUpdateWorkflowExecution_RequestIDTooLong() {
+	config := s.newConfig()
+	config.MaxIDLengthLimit = dc.GetIntPropertyFn(10)
+	wh := s.getWorkflowHandler(config)
+
+	request := &workflowservice.UpdateWorkflowExecutionRequest{
+		Namespace: s.testNamespace.String(),
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: "workflow-id",
+		},
+		Request: &updatepb.Request{
+			Meta:      &updatepb.Meta{UpdateId: "ok"},
+			Input:     &updatepb.Input{Name: "n"},
+			RequestId: strings.Repeat("a", 11), // exceeds the test-configured 10-char limit.
+		},
+	}
+
+	resp, err := wh.UpdateWorkflowExecution(context.Background(), request)
+	s.Nil(resp)
+	s.Equal(errRequestIDTooLong, err)
+}
+
 func (s *WorkflowHandlerSuite) TestUpdateWorkflowExecutionOptions_Priority() {
 	config := s.newConfig()
 	wh := s.getWorkflowHandler(config)

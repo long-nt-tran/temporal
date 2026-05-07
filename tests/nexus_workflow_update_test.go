@@ -109,19 +109,29 @@ func makeUpdateWithCallbackHandler(
 			if err != nil {
 				return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "update call failed: %v", err)
 			}
-			// Verify the response contains a link.
+			// Verify the response contains a link. On failure, return errors and let the test observe the operation failure.
 			link := resp.GetLink()
-			require.NotNil(t, link, "update response should contain a link")
+			if link == nil {
+				return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "update response should contain a link")
+			}
 			if workflowEvent := link.GetWorkflowEvent(); workflowEvent != nil {
-				// Accepted/completed update: link points to the accepted event.
-				require.Equal(t, cfg.childWfID, workflowEvent.GetWorkflowId())
-				require.Equal(t, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED, workflowEvent.GetRequestIdRef().GetEventType())
+				// Accepted/completed update: expect link to point to the accepted event.
+				if got := workflowEvent.GetWorkflowId(); got != cfg.childWfID {
+					return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "expected workflow event link wfID %q, got %q", cfg.childWfID, got)
+				}
+				if got := workflowEvent.GetRequestIdRef().GetEventType(); got != enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED {
+					return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "expected event type UPDATE_ACCEPTED, got %v", got)
+				}
 			} else if wfLink := link.GetWorkflow(); wfLink != nil {
-				// Rejected update: link points to the workflow with a reason.
-				require.Equal(t, cfg.childWfID, wfLink.GetWorkflowId())
-				require.Equal(t, "Update rejected", wfLink.GetReason())
+				// Rejected update: expect link to point to the workflow with a reason.
+				if got := wfLink.GetWorkflowId(); got != cfg.childWfID {
+					return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "expected workflow link wfID %q, got %q", cfg.childWfID, got)
+				}
+				if got := wfLink.GetReason(); got != "Update rejected" {
+					return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "expected reason %q, got %q", "Update rejected", got)
+				}
 			} else {
-				require.Fail(t, "link should be a workflow event or workflow link")
+				return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "link should be a workflow event or workflow link")
 			}
 			// If the update is already completed, return the result synchronously.
 			if outcome := resp.GetOutcome(); outcome != nil {
@@ -375,9 +385,10 @@ func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateNoCallbackAttachedOnAlr
 	s.Equal("updated: test | updated: test", result)
 	s.Equal(int32(2), operationCount.Load(), "expected two nexus operations to be started")
 
-	// Verify the child workflow has exactly one update callback (from the first request).
-	// The second request returns synchronously because the update is already completed,
-	// so no additional callback is attached.
+	// Verify the child workflow has no update callbacks remaining.
+	// Update callbacks self-clean from the CHASM tree after firing: both callbacks
+	// fired (the first when the update completed, the second immediately since the
+	// update was already done) and then removed themselves.
 	descResp, err := env.FrontendClient().DescribeWorkflowExecution(ctx, &workflowservice.DescribeWorkflowExecutionRequest{
 		Namespace: env.Namespace().String(),
 		Execution: &commonpb.WorkflowExecution{
@@ -391,7 +402,7 @@ func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateNoCallbackAttachedOnAlr
 			updateCallbackCount++
 		}
 	}
-	s.Equal(1, updateCallbackCount, "expected exactly one update callback on the child workflow")
+	s.Equal(0, updateCallbackCount, "update callbacks self-clean after firing: expected none remaining")
 
 	// Verify the child workflow has the correct request ID infos.
 	// Each nexus operation generates a unique request ID. If the second operation
@@ -1036,7 +1047,7 @@ func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateCallbackOnFailedUpdate(
 
 // TestWorkflowUpdateCallbackOnWorkflowTerminate verifies that when a workflow is
 // terminated while an update with completion callbacks is in-flight (accepted, handler
-// blocking), the ProcessCloseCallbacks mechanism fires the callback and the caller's
+// blocking), the ScheduleCloseCallbacks mechanism fires the callback and the caller's
 // nexus operation completes.
 func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateCallbackOnWorkflowTerminate() {
 	env := newNexusTestEnv(s.T(), true, enableUpdateCallbacksOpts()...)
@@ -1096,7 +1107,7 @@ func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateCallbackOnWorkflowTermi
 	}, 10*time.Second, 500*time.Millisecond)
 
 	// Terminate the target workflow while the update is in-flight.
-	// ProcessCloseCallbacks should fire the update-level callbacks.
+	// ScheduleCloseCallbacks should fire the update-level callbacks.
 	s.NoError(env.SdkClient().TerminateWorkflow(ctx, cfg.childWfID, "", "testing terminate with inflight update callback"))
 
 	// The callback fires → nexus operation completes → caller workflow finishes.
@@ -1515,7 +1526,7 @@ func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateCallbackOnWorkflowCompl
 
 // TestWorkflowUpdateCallbackOnWorkflowCancellation verifies that when a workflow is
 // cancelled while an accepted update with completion callbacks is in-flight, the update
-// callbacks are fired via ProcessCloseCallbacks.
+// callbacks are fired via ScheduleCloseCallbacks.
 func (s *NexusWorkflowUpdateTestSuite) TestWorkflowUpdateCallbackOnWorkflowCancellation() {
 	env := newNexusTestEnv(s.T(), true, enableUpdateCallbacksOpts()...)
 	ctx := testcore.NewContext()

@@ -475,7 +475,14 @@ func buildCallbackInfosFromChasm(
 		return nil, serviceerror.NewInternal("failed to construct describe response")
 	}
 
-	result := make([]*workflowpb.CallbackInfo, 0, len(wf.Callbacks))
+	// Unfortunately we have to iterate through all updates here to get the right
+	// number of callbacks (note that we do this later anyway to extract them).
+	capHint := len(wf.Callbacks)
+	for _, ufield := range wf.Updates {
+		update := ufield.Get(chasmCtx)
+		capHint += len(update.Callbacks)
+	}
+	result := make([]*workflowpb.CallbackInfo, 0, capHint)
 	for _, field := range wf.Callbacks {
 		callback := field.Get(chasmCtx)
 

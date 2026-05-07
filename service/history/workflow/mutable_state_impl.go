@@ -743,17 +743,24 @@ func (ms *MutableStateImpl) GetNexusUpdateCompletion(
 		return nexusrpc.CompleteOperationOptions{}, serviceerror.NewNotFound("update not found")
 	}
 
-	var closeTime time.Time
+	var (
+		closeTime time.Time
+		outcome   *updatepb.Outcome
+	)
 	cevent, err := ms.getUpdateOutcomeEvent(ctx, updateID)
-	var outcome *updatepb.Outcome
 	if err != nil {
-		// If the workflow is complete but the update outcome is missing we need to respond to all callbacks
+		// The update has no completion event. Handle subcases:
 		ce, errCE := ms.GetCompletionEvent(ctx)
 		if errors.Is(errCE, ErrMissingWorkflowCompletionEvent) {
+			// (a) workflow not closed (or its completion event is missing):
+			//     surface the original update-outcome lookup error.
 			return nexusrpc.CompleteOperationOptions{}, err
 		} else if errCE != nil {
 			return nexusrpc.CompleteOperationOptions{}, errCE
 		}
+		// (b) the workflow completed without finishing the update:
+		//     indicate to caller that the update was accepted but
+		//     received a 'failure' outcome.
 		outcome = &updatepb.Outcome{
 			Value: &updatepb.Outcome_Failure{
 				Failure: update.AcceptedUpdateCompletedWorkflowFailure,
@@ -761,6 +768,7 @@ func (ms *MutableStateImpl) GetNexusUpdateCompletion(
 		}
 		closeTime = ce.GetEventTime().AsTime()
 	} else {
+		// Update completed normally: read the outcome from its completion event.
 		outcome = cevent.GetWorkflowExecutionUpdateCompletedEventAttributes().GetOutcome()
 		closeTime = cevent.GetEventTime().AsTime()
 	}
@@ -794,7 +802,12 @@ func (ms *MutableStateImpl) GetNexusUpdateCompletion(
 	} else if outcome.GetFailure() != nil {
 		return nexusCompleteOperationFailure(outcome.GetFailure(), nexus.OperationStateFailed, "operation failed", startTime, closeTime, links)
 	}
-	return nexusrpc.CompleteOperationOptions{}, serviceerror.NewInternalf("unknown update outcome for update ID: %s", updateID)
+	return nexusrpc.CompleteOperationOptions{}, softassert.UnexpectedInternalErr(
+		ms.logger,
+		"unknown update outcome",
+		nil,
+		tag.NewStringTag("update-id", updateID),
+	)
 }
 
 // nexusCompleteOperationSuccess constructs a successful CompleteOperationOptions from the given payloads.
@@ -5547,18 +5560,21 @@ func (ms *MutableStateImpl) AddWorkflowExecutionUpdateAcceptedEvent(
 	if err := ms.checkMutability(tag.WorkflowActionUpdateAccepted); err != nil {
 		return nil, err
 	}
-	event := ms.hBuilder.AddWorkflowExecutionUpdateAcceptedEvent(updateID, acceptedRequestMessageID, acceptedRequestSequencingEventID, acceptedRequest)
-	if err := ms.ApplyWorkflowExecutionUpdateAcceptedEvent(event); err != nil {
-		return nil, err
-	}
-	// Add links from Nexus callbacks to the event.
-	callbacksLinks := make([]*commonpb.Link, 0)
+	event := ms.hBuilder.AddWorkflowExecutionUpdateAcceptedEvent(
+		updateID, acceptedRequestMessageID, acceptedRequestSequencingEventID, acceptedRequest,
+	)
+	// Attach links from Nexus callbacks to the event before Apply so they
+	// are visible when the event is replayed/reapplied.
+	var callbacksLinks []*commonpb.Link
 	for _, cb := range acceptedRequest.GetCompletionCallbacks() {
 		if cb.GetNexus() != nil {
 			callbacksLinks = append(callbacksLinks, cb.GetLinks()...)
 		}
 	}
 	event.Links = callbacksLinks
+	if err := ms.ApplyWorkflowExecutionUpdateAcceptedEvent(event); err != nil {
+		return nil, err
+	}
 	return event, nil
 }
 
@@ -5673,7 +5689,7 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionUpdateCompletedEvent(
 }
 
 func (ms *MutableStateImpl) RejectWorkflowExecutionUpdate(updateID string, wfFailure *failurepb.Failure) error {
-	if !ms.chasmCallbacksEnabled() {
+	if !ms.ChasmEnabled() {
 		return nil
 	}
 
@@ -5683,7 +5699,7 @@ func (ms *MutableStateImpl) RejectWorkflowExecutionUpdate(updateID string, wfFai
 	}
 
 	// Return early if there are no CHASM update callbacks for this update.
-	if _, ok := wf.Updates[updateID]; !ok {
+	if !wf.HasPendingUpdateCallbacksFor(updateID) {
 		return nil
 	}
 
@@ -5702,21 +5718,18 @@ func (ms *MutableStateImpl) processUpdateCallbacks(updateID string) error {
 		return err
 	}
 
-	// Return early if there are no chasm callbacks to process for this update ID.
-	if len(wf.Updates) == 0 {
-		return nil
-	}
-	if _, ok := wf.Updates[updateID]; !ok {
+	// Avoid the writable-component allocation if there are no callbacks for
+	// this update.
+	if !wf.HasPendingUpdateCallbacksFor(updateID) {
 		return nil
 	}
 
-	// If there are callbacks to process, create a writable workflow component.
 	wf, ctx, err := ms.ChasmWorkflowComponent(context.Background())
 	if err != nil {
 		return err
 	}
 
-	return wf.ProcessUpdateCallbacks(ctx, updateID)
+	return wf.ScheduleUpdateCallbacks(ctx, updateID)
 }
 
 func (ms *MutableStateImpl) AddWorkflowExecutionOptionsUpdatedEvent(
@@ -5786,7 +5799,7 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionOptionsUpdatedEvent(event *his
 		ms.AttachRequestID(attributes.GetAttachedRequestId(), event.EventType, event.EventId)
 	}
 
-	// Update completion callbacks.
+	// Add completion callbacks.
 	if err := ms.addCompletionCallbacks(
 		event,
 		attributes.GetAttachedRequestId(),
@@ -5795,7 +5808,7 @@ func (ms *MutableStateImpl) ApplyWorkflowExecutionOptionsUpdatedEvent(event *his
 		return err
 	}
 
-	// Add update callbacks
+	// Add update callbacks.
 	for _, updateOptions := range attributes.GetWorkflowUpdateOptions() {
 		updateID := updateOptions.GetUpdateId()
 		requestID := updateOptions.GetAttachedRequestId()
@@ -7028,7 +7041,7 @@ func (ms *MutableStateImpl) processUpdateCloseCallbacks() error {
 	if err != nil {
 		return err
 	}
-	if len(wf.Updates) == 0 {
+	if !wf.HasPendingUpdateCallbacks() {
 		return nil
 	}
 
@@ -7036,7 +7049,7 @@ func (ms *MutableStateImpl) processUpdateCloseCallbacks() error {
 	if err != nil {
 		return err
 	}
-	return wf.ProcessAllUpdateCloseCallbacks(ctx)
+	return wf.ScheduleAllUpdateCloseCallbacks(ctx)
 }
 
 // processCloseCallbacks triggers "WorkflowClosed" callbacks, applying the state machine transition that schedules
@@ -7090,18 +7103,16 @@ func (ms *MutableStateImpl) processCloseCallbacksChasm() error {
 		return err
 	}
 
-	// Return early if there are no chasm callbacks to process.
-	if len(wf.Callbacks) == 0 && len(wf.Updates) == 0 {
+	if !wf.HasPendingCloseCallbacks() {
 		return nil
 	}
 
-	// If there are callbacks to process, create a writable workflow component.
 	wf, ctx, err := ms.ChasmWorkflowComponent(context.Background())
 	if err != nil {
 		return err
 	}
 
-	return wf.ProcessCloseCallbacks(ctx)
+	return wf.ScheduleCloseCallbacks(ctx)
 }
 
 func (ms *MutableStateImpl) AddTasks(

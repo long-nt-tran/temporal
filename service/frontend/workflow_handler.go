@@ -5342,6 +5342,10 @@ func (wh *WorkflowHandler) prepareUpdateWorkflowRequest(
 		request.GetRequest().GetMeta().UpdateId = uuid.NewString()
 	}
 
+	if len(request.GetRequest().GetRequestId()) > wh.config.MaxIDLengthLimit() {
+		return errRequestIDTooLong
+	}
+
 	if request.GetRequest().GetInput() == nil {
 		return errUpdateInputNotSet
 	}

@@ -136,6 +136,16 @@ func TestUpdateState(t *testing.T) {
 					err = upd.Admit(&updatepb.Request{Meta: &updatepb.Meta{UpdateId: tv.UpdateID()}, Input: &updatepb.Input{}}, nil)
 					require.ErrorAs(t, err, &invalidArg)
 					require.ErrorContains(t, err, "input.name is not set")
+
+					err = upd.Admit(&updatepb.Request{
+						Meta:  &updatepb.Meta{UpdateId: tv.UpdateID()},
+						Input: &updatepb.Input{Name: "not_empty"},
+						CompletionCallbacks: []*commonpb.Callback{{
+							Variant: &commonpb.Callback_Nexus_{Nexus: &commonpb.Callback_Nexus{Url: "http://example/cb"}},
+						}},
+					}, nil)
+					require.ErrorAs(t, err, &invalidArg)
+					require.ErrorContains(t, err, "request_id is required when completion_callbacks are set")
 				},
 			}, {
 				title: "fail to transition to stateAdmitted on store write failure",
@@ -1255,50 +1265,51 @@ func TestAttachCallbacks(t *testing.T) {
 		return store, &count
 	}
 
-	t.Run("on stateAccepted fires callbacks and returns true", func(t *testing.T) {
+	t.Run("on stateAccepted writes event and returns wroteEvent=true", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, capturedOptions := capturingStore(effects)
 		upd := update.NewAccepted(tv.UpdateID(), testAcceptedEventID)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.True(t, wroteEvent)
 		require.Len(t, *capturedOptions, 1)
 		require.Equal(t, tv.UpdateID(), (*capturedOptions)[0].UpdateId)
 		require.Equal(t, tv.RequestID(), (*capturedOptions)[0].AttachedRequestId)
 		require.Equal(t, testCallbacks, (*capturedOptions)[0].AttachedCompletionCallbacks)
 	})
 
-	t.Run("on stateCompleted returns true without attaching callbacks", func(t *testing.T) {
+	t.Run("on stateCompleted returns wroteEvent=false without attaching callbacks", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, eventCreated := trackingStore(effects)
 		upd := update.NewCompleted(tv.UpdateID(), future.NewReadyFuture[*updatepb.Outcome](successOutcome, nil))
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent, "no event written for already-completed update")
 		require.False(t, *eventCreated, "should not attach callbacks when update is already completed")
 	})
 
-	t.Run("on stateCreated returns false without creating event", func(t *testing.T) {
+	t.Run("on stateCreated returns InvalidArgument", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, eventCreated := trackingStore(effects)
 		upd := update.New(tv.UpdateID())
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
-		require.NoError(t, err)
-		require.False(t, fired)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
+		require.False(t, wroteEvent)
+		var invalidArg *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArg, "stateCreated is not a valid state for AttachCallbacks")
 		require.False(t, *eventCreated)
 	})
 
-	t.Run("on stateAdmitted returns false without creating event at attachment time", func(t *testing.T) {
+	t.Run("on stateAdmitted returns wroteEvent=false without creating event at attachment time", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, eventCreated := trackingStore(effects)
 		upd := update.NewAdmitted(tv.UpdateID(), nil)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired, "stateAdmitted should return false so caller creates a speculative task")
+		require.False(t, wroteEvent, "callbacks are buffered, no event written")
 		require.False(t, *eventCreated, "no event written at attachment time, callbacks are buffered")
 	})
 
@@ -1309,15 +1320,15 @@ func TestAttachCallbacks(t *testing.T) {
 		mustAdmit(t, store, upd)
 		effects.Apply(context.Background())
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired)
+		require.False(t, wroteEvent, "stateAdmitted buffers — no event written here")
 		require.Equal(t, 0, *optionsEventCount, "no event at attachment time")
 
 		require.NoError(t, accept(t, store, upd))
 		effects.Apply(context.Background())
 
-		require.Equal(t, 1, *optionsEventCount, "buffered callback flushed as options event on acceptance")
+		require.Equal(t, 1, *optionsEventCount, "buffered callback persisted as options event on acceptance")
 	})
 
 	t.Run("on stateAdmitted dedup by requestID buffers only once", func(t *testing.T) {
@@ -1327,12 +1338,12 @@ func TestAttachCallbacks(t *testing.T) {
 		mustAdmit(t, store, upd)
 		effects.Apply(context.Background())
 
-		fired1, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent1, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired1)
-		fired2, err := upd.AttachCallbacks(testRequest, store)
+		require.False(t, wroteEvent1)
+		wroteEvent2, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired2, "dedup: callback already buffered, no new WFT needed")
+		require.False(t, wroteEvent2, "dedup: no event written")
 
 		require.NoError(t, accept(t, store, upd))
 		effects.Apply(context.Background())
@@ -1340,21 +1351,24 @@ func TestAttachCallbacks(t *testing.T) {
 		require.Equal(t, 1, *optionsEventCount, "duplicate requestID deduped — only one event written")
 	})
 
-	t.Run("on stateAdmitted rejection flushes buffered callbacks", func(t *testing.T) {
+	t.Run("on stateAdmitted rejection drops buffered callbacks without persisting", func(t *testing.T) {
+		// Buffered callbacks are not persisted on rejection — the synchronous
+		// API caller observes the rejection via WaitLifecycleStage, so we
+		// preserve the "no persistence writes on reject" property.
 		effects := &effect.Buffer{}
 		store, optionsEventCount := countingOptionsStore(effects)
 		upd := update.New(tv.UpdateID())
 		mustAdmit(t, store, upd)
 		effects.Apply(context.Background())
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired)
+		require.False(t, wroteEvent)
 
 		require.NoError(t, reject(t, store, upd))
 		effects.Apply(context.Background())
 
-		require.Equal(t, 1, *optionsEventCount, "buffered callback flushed before rejection so CHASM can fire it")
+		require.Equal(t, 0, *optionsEventCount, "rejection must not persist buffered callbacks")
 	})
 
 	t.Run("on stateAdmitted abort clears buffer without flushing", func(t *testing.T) {
@@ -1368,9 +1382,9 @@ func TestAttachCallbacks(t *testing.T) {
 		mustAdmit(t, store, upd)
 		effects.Apply(context.Background())
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired)
+		require.False(t, wroteEvent)
 
 		upd.Abort(update.AbortReasonWorkflowCompleted, effects)
 		effects.Apply(context.Background())
@@ -1378,7 +1392,7 @@ func TestAttachCallbacks(t *testing.T) {
 		require.Equal(t, 0, *optionsEventCount, "abort cannot flush — callbacks dropped (known limitation)")
 	})
 
-	t.Run("on stateSent buffers callbacks and returns true", func(t *testing.T) {
+	t.Run("on stateSent buffers callbacks and returns wroteEvent=false", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, optionsEventCount := countingOptionsStore(effects)
 		upd := update.New(tv.UpdateID())
@@ -1387,9 +1401,9 @@ func TestAttachCallbacks(t *testing.T) {
 		msg := send(t, upd, skipAlreadySent)
 		require.NotNil(t, msg)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent, "stateSent buffers in memory; no event written here")
 
 		// Accept the update — this should flush the buffered callbacks.
 		require.NoError(t, accept(t, store, upd))
@@ -1407,12 +1421,12 @@ func TestAttachCallbacks(t *testing.T) {
 		_ = send(t, upd, skipAlreadySent)
 
 		// Call AttachCallbacks twice with the same requestID.
-		fired1, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent1, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired1)
-		fired2, err := upd.AttachCallbacks(testRequest, store)
+		require.False(t, wroteEvent1)
+		wroteEvent2, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired2)
+		require.False(t, wroteEvent2)
 
 		require.NoError(t, accept(t, store, upd))
 		effects.Apply(context.Background())
@@ -1440,12 +1454,12 @@ func TestAttachCallbacks(t *testing.T) {
 			RequestId:           "request-2",
 			CompletionCallbacks: testCallbacks,
 		}
-		fired1, err := upd.AttachCallbacks(req1, store)
+		wroteEvent1, err := upd.AttachCallbacks(req1, store)
 		require.NoError(t, err)
-		require.True(t, fired1)
-		fired2, err := upd.AttachCallbacks(req2, store)
+		require.False(t, wroteEvent1)
+		wroteEvent2, err := upd.AttachCallbacks(req2, store)
 		require.NoError(t, err)
-		require.True(t, fired2)
+		require.False(t, wroteEvent2)
 
 		require.NoError(t, accept(t, store, upd))
 		effects.Apply(context.Background())
@@ -1464,9 +1478,9 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		require.NoError(t, accept(t, store, upd))
 		effects.Apply(context.Background())
@@ -1490,16 +1504,20 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		err = accept(t, store, upd)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "flush error")
 	})
 
-	t.Run("provisional states still return ResourceExhausted", func(t *testing.T) {
+	t.Run("provisional states return InvalidArgument", func(t *testing.T) {
+		// AttachCallbacks should never see a provisional state in practice
+		// (the workflow lock guarantees provisional transitions have committed
+		// before another API call gets here). If it does, treat it as an
+		// invalid state — the caller has a bug.
 		effects := &effect.Buffer{}
 		store := mockEventStore{Controller: effects}
 		upd := update.New(tv.UpdateID())
@@ -1510,14 +1528,17 @@ func TestAttachCallbacks(t *testing.T) {
 		// Accept but do NOT apply effects — update is in stateProvisionallyAccepted.
 		require.NoError(t, accept(t, store, upd))
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
-		require.False(t, fired)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
+		require.False(t, wroteEvent)
 		require.Error(t, err)
-		var resourceExhaustedErr *serviceerror.ResourceExhausted
-		require.ErrorAs(t, err, &resourceExhaustedErr)
+		var invalidArg *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArg)
 	})
 
-	t.Run("on stateSent rejection flushes buffered callbacks before rejecting", func(t *testing.T) {
+	t.Run("on stateSent rejection drops buffered callbacks without persisting", func(t *testing.T) {
+		// Same as the stateAdmitted variant: rejection must not persist any
+		// of the buffered callbacks. The caller observes the rejection
+		// synchronously via WaitLifecycleStage.
 		effects := &effect.Buffer{}
 		store, optionsEventCount := countingOptionsStore(effects)
 		upd := update.New(tv.UpdateID())
@@ -1525,22 +1546,23 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		err = reject(t, store, upd)
 		require.NoError(t, err)
 		effects.Apply(context.Background())
 
-		require.Equal(t, 1, *optionsEventCount, "buffered callbacks flushed as options event before rejection so CHASM can fire them")
+		require.Equal(t, 0, *optionsEventCount, "rejection must not persist buffered callbacks")
 	})
 
-	t.Run("on stateSent rejection with closed workflow skips flush and succeeds", func(t *testing.T) {
+	t.Run("rejection succeeds even when workflow can no longer add events", func(t *testing.T) {
+		// Buffered callbacks are dropped on rejection without writing any
+		// events, so the rejection path must not depend on CanAddEvent and
+		// must succeed even on a closed workflow. The API caller still gets
+		// the rejection synchronously via WaitLifecycleStage.
 		effects := &effect.Buffer{}
-
-		// Mock event store that emulates a closed workflow (CanAddEventFunc always returns false) to test that we will skip
-		// flushing callbacks on rejection.
 		optionsEventWritten := false
 		store := mockEventStore{
 			Controller:      effects,
@@ -1558,13 +1580,13 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, mockEventStore{Controller: effects})
+		wroteEvent, err := upd.AttachCallbacks(testRequest, mockEventStore{Controller: effects})
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		err = reject(t, store, upd)
 		require.NoError(t, err, "rejection must succeed even when CanAddEvent is false")
-		require.False(t, optionsEventWritten, "must not attempt to write options event when workflow is closed")
+		require.False(t, optionsEventWritten, "rejection must not write any options event")
 		effects.Apply(context.Background())
 
 		status, err := upd.WaitLifecycleStage(immediateCtx, UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED, immediateTimeout)
@@ -1581,9 +1603,9 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		// Simulate Update struct being lost — create a new one from mutable state.
 		upd2 := update.NewAdmitted(tv.UpdateID(), nil)
@@ -1602,18 +1624,18 @@ func TestAttachCallbacks(t *testing.T) {
 		effects.Apply(context.Background())
 		_ = send(t, upd, skipAlreadySent)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent)
 
 		// Simulate loss — new struct from mutable state.
 		upd2 := update.NewAdmitted(tv.UpdateID(), nil)
 		_ = send(t, upd2, skipAlreadySent)
 
 		// Same requestID can buffer again on new struct.
-		fired2, err := upd2.AttachCallbacks(testRequest, store)
+		wroteEvent2, err := upd2.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired2)
+		require.False(t, wroteEvent2)
 
 		require.NoError(t, accept(t, store, upd2))
 		effects.Apply(context.Background())
@@ -1630,9 +1652,9 @@ func TestAttachCallbacks(t *testing.T) {
 		}
 		upd := update.NewAccepted(tv.UpdateID(), testAcceptedEventID)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.False(t, wroteEvent, "already-persisted requestID — no event written")
 		require.Equal(t, 0, *optionsEventCount,
 			"already-persisted requestID should not write another event")
 	})
@@ -1650,8 +1672,8 @@ func TestAttachCallbacks(t *testing.T) {
 		}
 		upd := update.NewAccepted(tv.UpdateID(), testAcceptedEventID)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
-		require.False(t, fired)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
+		require.False(t, wroteEvent)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "store error")
 	})
@@ -1665,13 +1687,13 @@ func TestAttachCallbacks(t *testing.T) {
 			Input: &updatepb.Input{Name: "not_empty"},
 		}
 
-		fired, err := upd.AttachCallbacks(emptyRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(emptyRequest, store)
 		require.NoError(t, err)
-		require.False(t, fired, "should return false when no callbacks to attach — preserves existing caller behavior")
+		require.False(t, wroteEvent, "should return false when no callbacks to attach")
 		require.False(t, *eventCreated, "should not create event when no callbacks and no request ID")
 	})
 
-	t.Run("dedup by requestID on stateAccepted returns true without creating event", func(t *testing.T) {
+	t.Run("dedup by requestID on stateAccepted returns wroteEvent=false without creating event", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		eventCreated := false
 		store := mockEventStore{
@@ -1689,9 +1711,9 @@ func TestAttachCallbacks(t *testing.T) {
 		}
 		upd := update.NewAccepted(tv.UpdateID(), testAcceptedEventID)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired, "should return true so caller can wait on existing update")
+		require.False(t, wroteEvent, "dedup case: no event written")
 		require.False(t, eventCreated, "should not create event for duplicate requestID")
 	})
 
@@ -1703,9 +1725,9 @@ func TestAttachCallbacks(t *testing.T) {
 		}
 		upd := update.NewAccepted(tv.UpdateID(), testAcceptedEventID)
 
-		fired, err := upd.AttachCallbacks(testRequest, store)
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
 		require.NoError(t, err)
-		require.True(t, fired)
+		require.True(t, wroteEvent)
 		require.Len(t, *capturedOptions, 1)
 		require.Equal(t, tv.UpdateID(), (*capturedOptions)[0].UpdateId)
 		require.Equal(t, tv.RequestID(), (*capturedOptions)[0].AttachedRequestId)

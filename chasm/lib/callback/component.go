@@ -18,6 +18,15 @@ type CompletionSource interface {
 	GetNexusCompletion(ctx chasm.Context, requestID string) (nexusrpc.CompleteOperationOptions, error)
 }
 
+// CallbackParent allows parent of Callback to optionally implement a
+// RemoveCallback function which allows the Callback to drop itself
+// when it reaches a terminal state.
+// This is entirely opt-in -- parents that don't implement this interface
+// are unaffected.
+type CallbackParent interface {
+	RemoveCallback(ctx chasm.MutableContext, c *Callback)
+}
+
 var _ chasm.Component = (*Callback)(nil)
 var _ chasm.StateMachine[callbackspb.CallbackStatus] = (*Callback)(nil)
 
@@ -117,28 +126,40 @@ func (c *Callback) saveResult(
 	ctx chasm.MutableContext,
 	input saveResultInput,
 ) (chasm.NoValue, error) {
+	var transitionErr error
 	switch r := input.result.(type) {
 	case invocationResultOK:
-		err := TransitionSucceeded.Apply(c, ctx, EventSucceeded{Time: ctx.Now(c)})
-		return nil, err
+		transitionErr = TransitionSucceeded.Apply(c, ctx, EventSucceeded{Time: ctx.Now(c)})
 	case invocationResultRetry:
-		err := TransitionAttemptFailed.Apply(c, ctx, EventAttemptFailed{
+		transitionErr = TransitionAttemptFailed.Apply(c, ctx, EventAttemptFailed{
 			Time:        ctx.Now(c),
 			Err:         r.err,
 			RetryPolicy: input.retryPolicy,
 		})
-		return nil, err
 	case invocationResultFail:
-		err := TransitionFailed.Apply(c, ctx, EventFailed{
+		transitionErr = TransitionFailed.Apply(c, ctx, EventFailed{
 			Time: ctx.Now(c),
 			Err:  r.err,
 		})
-		return nil, err
 	default:
 		return nil, queueserrors.NewUnprocessableTaskError(
 			fmt.Sprintf("unrecognized callback result %v", input.result),
 		)
 	}
+	if transitionErr != nil {
+		return nil, transitionErr
+	}
+	// Opt-in self-cleanup on terminal transition: parents that don't
+	// implement CallbackParent are unaffected. The retry path leaves the
+	// callback in a non-terminal state, so isTerminated() short-circuits.
+	if c.LifecycleState(ctx) != chasm.LifecycleStateRunning {
+		if completionSource, ok := c.CompletionSource.TryGet(ctx); ok {
+			if parent, ok := completionSource.(CallbackParent); ok {
+				parent.RemoveCallback(ctx, c)
+			}
+		}
+	}
+	return nil, nil
 }
 
 // ToAPICallback converts a CHASM callback to API callback proto.
