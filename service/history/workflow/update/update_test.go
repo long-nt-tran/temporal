@@ -1412,6 +1412,36 @@ func TestAttachCallbacks(t *testing.T) {
 		require.Equal(t, 1, *optionsEventCount, "should flush one buffered callback on acceptance")
 	})
 
+	t.Run("on stateSent rollback restores pending callbacks for retry accept", func(t *testing.T) {
+		// When the WFT completion transaction rolls back (e.g., DB write failure), pendingCallbacks
+		// must be restored so that the next accept attempt can re-flush them.
+		effects := &effect.Buffer{}
+		store, optionsEventCount := countingOptionsStore(effects)
+		upd := update.New(tv.UpdateID())
+		mustAdmit(t, store, upd)
+		effects.Apply(context.Background())
+		msg := send(t, upd, skipAlreadySent)
+		require.NotNil(t, msg)
+
+		// Buffer a callback while in stateSent.
+		wroteEvent, err := upd.AttachCallbacks(testRequest, store)
+		require.NoError(t, err)
+		require.False(t, wroteEvent)
+
+		// First accept: persistPendingCallbacks runs synchronously and writes the OPTIONS_UPDATED event.
+		require.NoError(t, accept(t, store, upd))
+		require.Equal(t, 1, *optionsEventCount, "first accept must write OPTIONS_UPDATED for the buffered callback")
+
+		// Simulate a transaction rollback (e.g., persistence failure during WFT completion).
+		effects.Cancel(context.Background())
+
+		// Retry accept: pendingCallbacks must be restored by the rollback handler so the
+		// callback is not silently dropped.
+		require.NoError(t, accept(t, store, upd))
+		require.Equal(t, 2, *optionsEventCount, "retry accept after rollback must re-flush the buffered callback")
+		effects.Apply(context.Background())
+	})
+
 	t.Run("on stateSent dedup by requestID buffers only once", func(t *testing.T) {
 		effects := &effect.Buffer{}
 		store, optionsEventCount := countingOptionsStore(effects)

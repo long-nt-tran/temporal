@@ -175,6 +175,13 @@ func (u *Update) WaitLifecycleStage(
 		var outcome *updatepb.Outcome
 		outcome, err = u.outcome.Get(stCtx)
 		if err == nil {
+			// If rejection is set (i.e., via reject(...)), we should return this as the status. This allows
+			// caller to correctly identify the outcome of the update.
+			if u.accepted.Ready() {
+				if rejection, _ := u.accepted.Get(context.Background()); rejection != nil {
+					return statusRejected(rejection), nil
+				}
+			}
 			return statusCompleted(outcome), nil
 		}
 
@@ -628,6 +635,10 @@ func (u *Update) onAcceptanceMsg(
 	// Persist any callbacks that were buffered by AttachCallbacks while in
 	// stateAdmitted or stateSent. See persistPendingCallbacks for why this
 	// writes one event per pending entry.
+	//
+	// Save before flushing: if the transaction rolls back, the rollback handler
+	// below restores pendingCallbacks so the next accept attempt can re-flush.
+	savedPendingCallbacks := u.pendingCallbacks
 	if err := u.persistPendingCallbacks(eventStore); err != nil {
 		return err
 	}
@@ -674,7 +685,7 @@ func (u *Update) onAcceptanceMsg(
 			return
 		}
 		u.acceptedEventID = common.EmptyEventID
-		u.pendingCallbacks = nil
+		u.pendingCallbacks = savedPendingCallbacks
 		u.setState(prevState)
 	})
 	return nil
