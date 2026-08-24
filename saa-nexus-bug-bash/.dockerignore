@@ -1,0 +1,9 @@
+# The Docker build clones+builds its own sdk-typescript from source (see
+# deploy/docker/worker-lambda.Dockerfile) — never send the local macOS
+# checkout (wrong OS/arch, huge Rust target/ dirs) into the build context.
+sdk-typescript/
+ts/node_modules/
+out/
+node_modules
+.git/
+*.tgz

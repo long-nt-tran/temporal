@@ -1,0 +1,33 @@
+{
+  "name": "saa-nexus-bug-bash",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PayFast: Nexus + Standalone Activity bug-bash worker, workflows, and scenario harness.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc --build",
+    "bundle-workflows": "node scripts/bundle-workflows.js",
+    "worker": "node ../out/ts/src/worker.js",
+    "scenario": "node ../out/ts/src/client/scenarios.js",
+    "caller": "node ../out/ts/src/client/caller.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@temporalio/activity": "file:../sdk-typescript/packages/activity",
+    "@temporalio/client": "file:../sdk-typescript/packages/client",
+    "@temporalio/common": "file:../sdk-typescript/packages/common",
+    "@temporalio/envconfig": "file:../sdk-typescript/packages/envconfig",
+    "@temporalio/lambda-worker": "file:../sdk-typescript/packages/lambda-worker",
+    "@temporalio/nexus": "file:../sdk-typescript/packages/nexus",
+    "@temporalio/proto": "file:../sdk-typescript/packages/proto",
+    "@temporalio/worker": "file:../sdk-typescript/packages/worker",
+    "@temporalio/workflow": "file:../sdk-typescript/packages/workflow",
+    "long": "^5.3.2",
+    "nexus-rpc": "^0.0.3"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}

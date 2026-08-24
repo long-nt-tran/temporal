@@ -1,0 +1,29 @@
+# Dynamic config overrides for the Nexus + Standalone Activity (SAA) bug bash.
+#
+# Point a locally-built temporal-server at this file, e.g. by setting
+# dynamicConfigClient.filepath in config/development-sqlite.yaml to its
+# absolute path, then:
+#   make bins
+#   ./temporal-server --config-file config/development-sqlite.yaml --allow-no-auth start
+#
+# activity.enableStandalone and history.enableChasm already default to true;
+# they're listed here for visibility. The two that matter are
+# nexusoperation.enableChasmWorkflowOperations and activity.enableCallbacks —
+# without both, SAA-backed Nexus operations (chargeOrder, startSubscription,
+# refundCharge, runLongTask) fail with "standalone activity is only
+# available with chasm enabled".
+
+activity.enableStandalone:
+  - value: true
+
+activity.enableCallbacks:
+  - value: true
+
+history.enableChasm:
+  - value: true
+
+nexusoperation.enableChasmWorkflowOperations:
+  - value: true
+
+nexusoperation.chasmWorkflowOperationsRolloutPercent:
+  - value: 100

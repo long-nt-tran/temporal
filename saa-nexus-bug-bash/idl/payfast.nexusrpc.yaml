@@ -1,0 +1,158 @@
+nexusrpc: "1.0.0"
+$schema: https://json-schema.org/draft/2020-12/schema
+description: >-
+  PayFast: a small payments Nexus service built for a Nexus + Standalone
+  Activity (SAA) bug bash. Every operation targets one of six scenarios:
+  idempotency under retry, uncooperative cancellation, failure/timeout
+  semantics, worker restart mid-activity, circuit breaker tripping, and
+  token/link handling. See ../README.md for the scenario-to-operation map
+  and CARD_TOKENS.md for the chaos vocabulary carried in cardToken.
+services:
+  PayFast:
+    fqn: bugbash.payfast.v1.PayFast
+    description: SAA-backed and workflow-backed payment operations, side by side.
+    operations:
+      chargeOrder:
+        description: >-
+          One-shot charge. The handler backs this operation directly with a
+          Standalone Activity Execution (no parent workflow on the handler
+          side). orderId is the idempotency key: reuse it across attempts to
+          test dedup, mint a fresh one per attempt to see the bug.
+        input: { $ref: "#/$defs/ChargeRequest" }
+        output: { $ref: "#/$defs/ChargeResult" }
+      chargeOrderViaWorkflow:
+        description: >-
+          Same contract as chargeOrder, but the handler backs the operation
+          with a Workflow run instead of a Standalone Activity. The workflow
+          invokes the exact same activity code as chargeOrder. Use this to
+          diff failure/cancel/timeout semantics between the two backings.
+        input: { $ref: "#/$defs/ChargeRequest" }
+        output: { $ref: "#/$defs/ChargeResult" }
+      startSubscription:
+        description: >-
+          Kicks off a self-renewing chain of Standalone Activities, one per
+          billing cycle. Each cycle, on success, starts the next cycle's
+          activity itself. maxCycles is a hard stop so nothing runs forever
+          unattended.
+        input: { $ref: "#/$defs/SubscriptionRequest" }
+        output: { $ref: "#/$defs/ChargeResult" }
+      getCharge:
+        description: >-
+          Rehydrated-handle lookup: reconstructs a handle to a charge from
+          nothing but its chargeId (no stored token needed) and waits for
+          its outcome. Works for charges started by chargeOrder or
+          chargeOrderViaWorkflow.
+        input: { $ref: "#/$defs/ChargeHandle" }
+        output: { $ref: "#/$defs/ChargeResult" }
+      refundCharge:
+        description: Refund a previously succeeded charge. SAA-backed.
+        input: { $ref: "#/$defs/ChargeHandle" }
+        output: { $ref: "#/$defs/RefundResult" }
+      runLongTask:
+        description: >-
+          Long-running, heartbeating Standalone Activity with a selectable
+          cancel behavior. Purpose-built for the worker-restart-mid-activity
+          and uncooperative-cancellation drills.
+        input: { $ref: "#/$defs/LongTaskRequest" }
+        output: { $ref: "#/$defs/LongTaskResult" }
+$defs:
+  ChargeRequest:
+    type: object
+    additionalProperties: false
+    properties:
+      orderId:
+        description: Idempotency key. Also used to derive the backing execution's ID.
+        type: string
+        minLength: 1
+      amountCents: { type: integer, minimum: 1 }
+      cardToken:
+        description: >-
+          Chaos token selecting how the charge behaves. See CARD_TOKENS.md
+          for the full vocabulary (ok, decline, pending_review,
+          retry_{n}_then_ok, retry_forever, fail_nonretryable,
+          timeout_{n}s, hang). Unrecognized tokens are declined with
+          errorCode "unknown_card_token".
+        type: string
+      cancelBehavior:
+        description: >-
+          Selects how the backing activity reacts to a cancel request.
+          Absent means cooperative.
+        type: string
+        enum: [cooperative, heartbeat_ignore_cancel, ignore_cancel_entirely]
+    required: [orderId, amountCents, cardToken]
+  SubscriptionRequest:
+    type: object
+    additionalProperties: false
+    properties:
+      subId: { type: string, minLength: 1 }
+      cycleN:
+        description: Caller passes 0 to start a new subscription.
+        type: integer
+        minimum: 0
+      amountCents: { type: integer, minimum: 1 }
+      cardToken: { type: string }
+      idStrategy:
+        description: >-
+          derived = "sub-{subId}-cycle-{cycleN}" (idempotent); random = uuid
+          (intentionally bad, to observe duplicate cycles).
+        type: string
+        enum: [derived, random]
+      maxCycles:
+        description: Governor. Hard stop so nothing runs forever unattended.
+        type: integer
+        minimum: 1
+    required: [subId, cycleN, amountCents, cardToken, idStrategy, maxCycles]
+  ChargeResult:
+    type: object
+    additionalProperties: false
+    properties:
+      chargeId: { type: string }
+      status:
+        type: string
+        enum: [succeeded, declined, pending_review, failed]
+      amountCents: { type: integer }
+      backing:
+        description: Which handler backed this charge.
+        type: string
+        enum: [standalone_activity, workflow]
+      attemptCount:
+        description: Activity attempts observed before this result. Useful for confirming retry/circuit-breaker behavior.
+        type: integer
+      errorCode: { type: string }
+      errorMessage: { type: string }
+    required: [chargeId, status, amountCents, backing]
+  ChargeHandle:
+    type: object
+    additionalProperties: false
+    properties:
+      chargeId: { type: string }
+    required: [chargeId]
+  RefundResult:
+    type: object
+    additionalProperties: false
+    properties:
+      refundId: { type: string }
+      status: { type: string, enum: [succeeded, failed] }
+    required: [refundId, status]
+  LongTaskRequest:
+    type: object
+    additionalProperties: false
+    properties:
+      taskId: { type: string, minLength: 1 }
+      durationSeconds: { type: integer, minimum: 1 }
+      heartbeatIntervalSeconds: { type: integer, minimum: 1 }
+      cancelBehavior:
+        description: >-
+          Selects how the activity reacts to a cancel request. Absent means
+          cooperative.
+        type: string
+        enum: [cooperative, heartbeat_ignore_cancel, ignore_cancel_entirely]
+    required: [taskId, durationSeconds, heartbeatIntervalSeconds]
+  LongTaskResult:
+    type: object
+    additionalProperties: false
+    properties:
+      taskId: { type: string }
+      status: { type: string, enum: [completed, cancelled, failed] }
+      elapsedSeconds: { type: integer }
+    required: [taskId, status, elapsedSeconds]
