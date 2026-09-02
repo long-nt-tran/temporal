@@ -1,0 +1,9 @@
+[
+  "temporalvalidate.v1.dynamic_global_max_id_length",
+  "temporalvalidate.v1.dynamic_namespace_max_operation_name_length",
+  "temporalvalidate.v1.dynamic_namespace_max_payload_size",
+  "temporalvalidate.v1.dynamic_namespace_max_reason_length",
+  "temporalvalidate.v1.dynamic_namespace_max_service_name_length",
+  "temporalvalidate.v1.dynamic_namespace_max_user_metadata_details_size",
+  "temporalvalidate.v1.dynamic_namespace_max_user_metadata_summary_size"
+]

@@ -2,11 +2,15 @@ package nexusoperation
 
 import (
 	"context"
+	"fmt"
 
+	"buf.build/go/protovalidate"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
+	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
+	temporalvalidatepb "go.temporal.io/api/temporalvalidate/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/chasm"
 	nexusoperationpb "go.temporal.io/server/chasm/lib/nexusoperation/gen/nexusoperationpb/v1"
@@ -14,6 +18,9 @@ import (
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/validation/dynamicvalidate"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -39,6 +46,57 @@ type frontendHandler struct {
 	namespaceRegistry namespace.Registry
 	endpointRegistry  commonnexus.EndpointRegistry
 	validator         *validator
+	protoValidator    protovalidate.Validator
+	dynamicValidator  *dynamicvalidate.Runner
+}
+
+func newDynamicValidator(config *Config) *dynamicvalidate.Runner {
+	lenLimit := func(limit func() int, msg string) dynamicvalidate.Rule {
+		return dynamicvalidate.GlobalStringRule(func(value string) error {
+			if got, limitValue := len(value), limit(); got > limitValue {
+				return fmt.Errorf("%s (length %d, limit %d)", msg, got, limitValue)
+			}
+			return nil
+		})
+	}
+	nsLenLimit := func(limit func(string) int, msg string) dynamicvalidate.Rule {
+		return dynamicvalidate.NamespaceStringRule(func(namespace string, value string) error {
+			if got, limitValue := len(value), limit(namespace); got > limitValue {
+				return fmt.Errorf("%s (length %d, limit %d)", msg, got, limitValue)
+			}
+			return nil
+		})
+	}
+	nsPayloadLimit := func(limit func(string) int, msg string) dynamicvalidate.Rule {
+		return dynamicvalidate.NamespaceMessageRule(&commonpb.Payload{}, func(namespace string, payload *commonpb.Payload) error {
+			if got, limitValue := payload.Size(), limit(namespace); got > limitValue {
+				return fmt.Errorf("%s (size %d, limit %d)", msg, got, limitValue)
+			}
+			return nil
+		})
+	}
+
+	return dynamicvalidate.New(dynamicvalidate.Registries{
+		Rules: map[protoreflect.ExtensionType]dynamicvalidate.Rule{
+			temporalvalidatepb.E_DynamicGlobalMaxIdLength:               lenLimit(config.MaxIDLengthLimit, "value exceeds the max ID length"),
+			temporalvalidatepb.E_DynamicNamespaceMaxServiceNameLength:   nsLenLimit(config.MaxServiceNameLength, "service exceeds the namespace's max length"),
+			temporalvalidatepb.E_DynamicNamespaceMaxOperationNameLength: nsLenLimit(config.MaxOperationNameLength, "operation exceeds the namespace's max length"),
+			temporalvalidatepb.E_DynamicNamespaceMaxReasonLength:        nsLenLimit(config.MaxReasonLength, "reason exceeds the namespace's max length"),
+			temporalvalidatepb.E_DynamicNamespaceMaxPayloadSize:         nsPayloadLimit(config.PayloadSizeLimit, "input exceeds the namespace's max payload size"),
+			temporalvalidatepb.E_DynamicNamespaceMaxUserMetadataSummarySize: dynamicvalidate.NamespaceMessageRule(&sdkpb.UserMetadata{}, func(namespace string, metadata *sdkpb.UserMetadata) error {
+				if got, limitValue := metadata.GetSummary().Size(), config.MaxUserMetadataSummarySize(namespace); got > limitValue {
+					return fmt.Errorf("user_metadata.summary exceeds the namespace's max size limit (size %d, limit %d)", got, limitValue)
+				}
+				return nil
+			}),
+			temporalvalidatepb.E_DynamicNamespaceMaxUserMetadataDetailsSize: dynamicvalidate.NamespaceMessageRule(&sdkpb.UserMetadata{}, func(namespace string, metadata *sdkpb.UserMetadata) error {
+				if got, limitValue := metadata.GetDetails().Size(), config.MaxUserMetadataDetailsSize(namespace); got > limitValue {
+					return fmt.Errorf("user_metadata.details exceeds the namespace's max size limit (size %d, limit %d)", got, limitValue)
+				}
+				return nil
+			}),
+		},
+	})
 }
 
 func NewFrontendHandler(
@@ -49,14 +107,31 @@ func NewFrontendHandler(
 	endpointRegistry commonnexus.EndpointRegistry,
 	saMapperProvider searchattribute.MapperProvider,
 	saValidator *searchattribute.Validator,
-) FrontendHandler {
+) (FrontendHandler, error) {
+	messages, err := validationMessages()
+	if err != nil {
+		return nil, err
+	}
+	protoValidator, err := protovalidate.New(
+		protovalidate.WithMessages(messages...),
+		protovalidate.WithDisableLazy(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	dynamicValidator := newDynamicValidator(config)
+	if err := dynamicValidator.Precompile(messages...); err != nil {
+		return nil, err
+	}
 	return &frontendHandler{
 		client:            client,
 		config:            config,
 		namespaceRegistry: namespaceRegistry,
 		endpointRegistry:  endpointRegistry,
 		validator:         newValidator(config, logger, saMapperProvider, saValidator),
-	}
+		protoValidator:    protoValidator,
+		dynamicValidator:  dynamicValidator,
+	}, nil
 }
 
 func (h *frontendHandler) StartNexusOperationExecution(
@@ -65,6 +140,9 @@ func (h *frontendHandler) StartNexusOperationExecution(
 ) (*workflowservice.StartNexusOperationExecutionResponse, error) {
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
+	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
 	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
@@ -97,6 +175,9 @@ func (h *frontendHandler) DescribeNexusOperationExecution(
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
 	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
+	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
@@ -122,6 +203,9 @@ func (h *frontendHandler) PollNexusOperationExecution(
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
 	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
+	}
 
 	if err := h.validator.validateAndNormalizePollRequest(req); err != nil {
 		return nil, err
@@ -145,6 +229,9 @@ func (h *frontendHandler) ListNexusOperationExecutions(
 ) (*workflowservice.ListNexusOperationExecutionsResponse, error) {
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
+	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
 	}
 
 	pageSize := req.GetPageSize()
@@ -208,6 +295,9 @@ func (h *frontendHandler) CountNexusOperationExecutions(
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
 	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := chasm.CountExecutions[*Operation](ctx, &chasm.CountExecutionsRequest{
 		NamespaceName: req.GetNamespace(),
@@ -238,6 +328,9 @@ func (h *frontendHandler) RequestCancelNexusOperationExecution(
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
 	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
+	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
@@ -265,6 +358,9 @@ func (h *frontendHandler) TerminateNexusOperationExecution(
 ) (*workflowservice.TerminateNexusOperationExecutionResponse, error) {
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
+	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
 	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
@@ -294,6 +390,9 @@ func (h *frontendHandler) DeleteNexusOperationExecution(
 	if !h.isStandaloneNexusOperationEnabled(req.GetNamespace()) {
 		return nil, ErrStandaloneNexusOperationDisabled
 	}
+	if err := h.validateProto(req); err != nil {
+		return nil, err
+	}
 
 	namespaceID, err := h.namespaceRegistry.GetNamespaceID(namespace.Name(req.GetNamespace()))
 	if err != nil {
@@ -318,4 +417,14 @@ func (h *frontendHandler) DeleteNexusOperationExecution(
 // isStandaloneNexusOperationEnabled checks if standalone Nexus operations are enabled for the given namespace.
 func (h *frontendHandler) isStandaloneNexusOperationEnabled(namespaceName string) bool {
 	return h.config.EnableChasm(namespaceName) && h.config.Enabled(namespaceName)
+}
+
+func (h *frontendHandler) validateProto(msg proto.Message) error {
+	if err := h.protoValidator.Validate(msg); err != nil {
+		return serviceerror.NewInvalidArgument(err.Error())
+	}
+	if err := h.dynamicValidator.CheckMessage(msg); err != nil {
+		return serviceerror.NewInvalidArgument(err.Error())
+	}
+	return nil
 }

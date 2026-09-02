@@ -201,6 +201,25 @@ func (s *WorkflowHandlerSuite) getWorkflowHandler(config *Config) *WorkflowHandl
 		metrics.NoopMetricsHandler,
 		log.NewNoopLogger(),
 	)
+	nexusFrontendHandler, err := nexusoperation.NewFrontendHandler(
+		nil,
+		&nexusoperation.Config{
+			MaxIDLengthLimit:           func() int { return 1000 },
+			MaxServiceNameLength:       func(string) int { return 1000 },
+			MaxOperationNameLength:     func(string) int { return 1000 },
+			MaxReasonLength:            func(string) int { return 1000 },
+			PayloadSizeLimit:           func(string) int { return 1000 },
+			MaxUserMetadataSummarySize: func(string) int { return 1000 },
+			MaxUserMetadataDetailsSize: func(string) int { return 1000 },
+		},
+		s.mockResource.GetLogger(),
+		s.mockResource.GetNamespaceRegistry(),
+		nil,
+		s.mockResource.GetSearchAttributesMapperProvider(),
+		nil,
+	)
+	s.Require().NoError(err)
+
 	return NewWorkflowHandler(
 		cbValidator,
 		config,
@@ -230,15 +249,7 @@ func (s *WorkflowHandlerSuite) getWorkflowHandler(config *Config) *WorkflowHandl
 		scheduler.NewSpecBuilder(func() int { return 0 }, func() int { return 0 }),
 		true,
 		nil, // Not testing activity handler here
-		nexusoperation.NewFrontendHandler(
-			nil,
-			nil,
-			s.mockResource.GetLogger(),
-			s.mockResource.GetNamespaceRegistry(),
-			nil,
-			s.mockResource.GetSearchAttributesMapperProvider(),
-			nil,
-		),
+		nexusFrontendHandler,
 		nil, // Not testing CHASM registry here
 		quotas.NoopRequestRateLimiter,
 		workflow.NewValidator(
