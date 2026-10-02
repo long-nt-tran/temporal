@@ -50,6 +50,7 @@ import (
 	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/common/testing/grpcfaultstest"
 	"go.temporal.io/server/common/testing/testhooks"
+	"go.temporal.io/server/common/validation"
 	"go.temporal.io/server/service"
 	"go.temporal.io/server/service/frontend/configs"
 	"go.temporal.io/server/service/history/tasks"
@@ -87,6 +88,8 @@ type (
 )
 
 var Module = fx.Options(
+	validation.Module,
+	fx.Decorate(validateWorkflowHandler, validateOperatorHandler),
 	resource.Module,
 	chasmtests.Module,
 	scheduler.Module,
@@ -168,7 +171,7 @@ func NewServiceProvider(
 	httpAPIServer *HTTPAPIServer,
 	handler Handler,
 	adminHandler *AdminHandler,
-	operatorHandler *OperatorHandlerImpl,
+	operatorHandler OperatorHandler,
 	versionChecker *VersionChecker,
 	visibilityMgr manager.VisibilityManager,
 	logger log.SnTaggedLogger,
@@ -267,6 +270,7 @@ func GrpcServerOptionsProvider(
 	contextMetadataInterceptor *interceptor.ContextMetadataInterceptor,
 	slowRequestLoggerInterceptor *interceptor.SlowRequestLoggerInterceptor,
 	chasmRequestVisibilityInterceptor *chasm.ChasmVisibilityInterceptor,
+	validationRegistry *validation.Registry,
 	customInterceptors []grpc.UnaryServerInterceptor,
 	customStreamInterceptors []grpc.StreamServerInterceptor,
 	metricsHandler metrics.Handler,
@@ -325,6 +329,7 @@ func GrpcServerOptionsProvider(
 		slowRequestLoggerInterceptor.Intercept,
 		chasmRequestVisibilityInterceptor.Intercept,
 		contextMetadataInterceptor.Intercept,
+		validationRegistry.Intercept,
 	}
 	if len(customInterceptors) > 0 {
 		// TODO: Deprecate WithChainedFrontendGrpcInterceptors and provide a inner custom interceptor
@@ -933,7 +938,7 @@ func OperatorHandlerProvider(
 	clientFactory client.Factory,
 	namespaceRegistry namespace.Registry,
 	nexusEndpointClient *NexusEndpointClient,
-) *OperatorHandlerImpl {
+) OperatorHandler {
 	args := NewOperatorHandlerImplArgs{
 		configuration,
 		logger,
@@ -1109,7 +1114,7 @@ func HTTPAPIServerProvider(
 	grpcListener net.Listener,
 	tlsConfigProvider encryption.TLSConfigProvider,
 	handler Handler,
-	operatorHandler *OperatorHandlerImpl,
+	operatorHandler OperatorHandler,
 	grpcServerOptions GrpcServerOptions,
 	metricsHandler metrics.Handler,
 	namespaceRegistry namespace.Registry,

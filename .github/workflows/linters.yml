@@ -172,6 +172,7 @@ jobs:
 
       - name: lint code
         run: |
+          make check-request-validation
           make GOLANGCI_LINT_FIX=false GOLANGCI_LINT_BASE_REV=HEAD~ lint-code
 
       - name: check-is-dirty
