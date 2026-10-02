@@ -652,6 +652,10 @@ const (
 )
 
 var (
+	ResponseValidationFailures = NewCounterDef(
+		"response_validation_failures",
+		WithDescription("Successful RPC responses that fail validation, including validator implementation failures."),
+	)
 	ServiceRequests = NewCounterDef(
 		"service_requests",
 		WithDescription("The number of RPC requests received by the service."),

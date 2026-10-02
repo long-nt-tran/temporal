@@ -404,7 +404,11 @@ lint-actions: $(ACTIONLINT)
 	@printf $(COLOR) "Linting GitHub actions..."
 	@$(ACTIONLINT)
 
-.PHONY: lint-code lint-code-fast
+.PHONY: lint-code lint-code-fast check-request-validation
+
+check-request-validation:
+	go run ./cmd/tools/genrequestvalidation -out common/validation/services_gen.go -check
+	go test -tags test_dep ./common/validation/... ./service/frontend ./cmd/tools/genrequestvalidation
 # --new-from-rev filters reported issues _after_ analysis; this target also reduces package inputs _before_ analysis.
 lint-code-fast:
 	@if ! git rev-parse --verify --quiet "$(GOLANGCI_LINT_BASE_REV)^{commit}" >/dev/null; then \
