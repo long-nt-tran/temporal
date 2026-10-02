@@ -1,7 +1,6 @@
 package nexusoperation
 
 import (
-	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -23,7 +22,9 @@ import (
 	"go.temporal.io/server/common/persistence/visibility/manager"
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/searchattribute/sadefs"
+	"go.temporal.io/server/common/validation"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -114,6 +115,7 @@ func TestValidateStartNexusOperationExecutionRequest(t *testing.T) {
 		MaxIDLengthLimit:                   func() int { return 50 },
 		MaxServiceNameLength:               func(string) int { return 10 },
 		MaxOperationNameLength:             func(string) int { return 10 },
+		MaxReasonLength:                    func(string) int { return 1000 },
 		PayloadSizeLimit:                   func(string) int { return 20 },
 		PayloadSizeLimitWarn:               func(string) int { return 10 },
 		MaxUserMetadataSummarySize:         func(string) int { return 10 },
@@ -561,7 +563,15 @@ func TestValidateStartNexusOperationExecutionRequest(t *testing.T) {
 			logger := log.NewNoopLogger()
 			v := newValidator(&caseConfig, logger, nil, saValidator, cbValidator, newTestLinkValidator(10, 10))
 
-			err := v.validateAndNormalizeStartRequest(context.Background(), req)
+			annotatedRequest := proto.Clone(req).(*workflowservice.StartNexusOperationExecutionRequest)
+			registry, registryErr := validation.NewRegistry(validation.APIServices(), testDynamicValidator(&caseConfig), log.NewNoopLogger(), metrics.NoopMetricsHandler)
+			require.NoError(t, registryErr)
+			annotatedErr := registry.Validate("/temporal.api.workflowservice.v1.WorkflowService/StartNexusOperationExecution", annotatedRequest)
+			if annotatedErr == nil {
+				annotatedErr = v.validateAndNormalizeStartRequest(t.Context(), annotatedRequest)
+			}
+			err := v.validateAndNormalizeStartRequest(t.Context(), req)
+			require.Equal(t, err == nil, annotatedErr == nil, "annotation validation changed accepted inputs: %v", annotatedErr)
 			if tc.wantErr != "" {
 				var invalidArgErr *serviceerror.InvalidArgument
 				require.ErrorAs(t, err, &invalidArgErr)
@@ -571,6 +581,12 @@ func TestValidateStartNexusOperationExecutionRequest(t *testing.T) {
 			}
 			if tc.postValidateCheck != nil {
 				tc.postValidateCheck(t, req)
+				tc.postValidateCheck(t, annotatedRequest)
+			}
+			if err == nil {
+				// request_id defaults to a new UUID on each validation call.
+				annotatedRequest.RequestId = req.RequestId
+				require.True(t, proto.Equal(req, annotatedRequest), "annotation validation changed normalization")
 			}
 		})
 	}

@@ -89,6 +89,7 @@ type (
 
 var Module = fx.Options(
 	validation.Module,
+	fx.Provide(fx.Annotate(ValidationRulesProvider, fx.ResultTags(`group:"validation-rules,flatten"`))),
 	fx.Decorate(validateWorkflowHandler, validateOperatorHandler),
 	resource.Module,
 	chasmtests.Module,

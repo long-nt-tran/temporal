@@ -408,7 +408,7 @@ lint-actions: $(ACTIONLINT)
 
 check-request-validation:
 	go run ./cmd/tools/genrequestvalidation -out common/validation/services_gen.go -check
-	go test -tags test_dep ./common/validation/... ./service/frontend ./cmd/tools/genrequestvalidation
+	go test -tags test_dep ./common/validation/... ./chasm/lib/nexusoperation/... ./service/frontend ./cmd/tools/genrequestvalidation
 # --new-from-rev filters reported issues _after_ analysis; this target also reduces package inputs _before_ analysis.
 lint-code-fast:
 	@if ! git rev-parse --verify --quiet "$(GOLANGCI_LINT_BASE_REV)^{commit}" >/dev/null; then \
