@@ -89,6 +89,7 @@ type (
 
 var Module = fx.Options(
 	validation.Module,
+	fx.Provide(ValidationRulesProvider),
 	fx.Decorate(validateWorkflowHandler, validateOperatorHandler),
 	resource.Module,
 	chasmtests.Module,
